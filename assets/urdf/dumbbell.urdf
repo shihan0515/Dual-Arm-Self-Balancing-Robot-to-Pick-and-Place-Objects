@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<robot name="dumbbell">
+  <!-- 中間握把：縮短至 0.08m, 半徑維持 0.006m -->
+  <link name="handle">
+    <visual>
+      <geometry>
+        <cylinder length="0.08" radius="0.006"/>
+      </geometry>
+      <material name="grey"><color rgba="0.5 0.5 0.5 1"/></material>
+    </visual>
+    <collision>
+      <geometry>
+        <cylinder length="0.08" radius="0.006"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.02"/>
+      <inertia ixx="0.000015" ixy="0.0" ixz="0.0" iyy="0.000015" iyz="0.0" izz="0.000001"/>
+    </inertial>
+  </link>
+
+  <!-- 左配重：偏移更新至 0.052m (半長 0.04 + 配重半厚 0.012) -->
+  <link name="left_weight">
+    <visual>
+      <origin xyz="0 0 0.052" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.024" radius="0.024"/>
+      </geometry>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.052" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.024" radius="0.024"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.04"/>
+      <inertia ixx="0.00004" ixy="0.0" ixz="0.0" iyy="0.00004" iyz="0.0" izz="0.00004"/>
+    </inertial>
+  </link>
+
+  <!-- 右配重：偏移更新至 -0.052m -->
+  <link name="right_weight">
+    <visual>
+      <origin xyz="0 0 -0.052" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.024" radius="0.024"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.052" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.024" radius="0.024"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.04"/>
+      <inertia ixx="0.00004" ixy="0.0" ixz="0.0" iyy="0.00004" iyz="0.0" izz="0.00004"/>
+    </inertial>
+  </link>
+
+  <!-- 中心目標點 handle_target -->
+  <link name="handle_target">
+    <visual>
+      <geometry>
+        <sphere radius="0.003"/>
+      </geometry>
+      <material name="yellow"><color rgba="1 1 0 1"/></material>
+    </visual>
+  </link>
+
+  <joint name="joint_left" type="fixed">
+    <parent link="handle"/>
+    <child link="left_weight"/>
+  </joint>
+
+  <joint name="joint_right" type="fixed">
+    <parent link="handle"/>
+    <child link="right_weight"/>
+  </joint>
+
+  <joint name="joint_target" type="fixed">
+    <parent link="handle"/>
+    <child link="handle_target"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>
