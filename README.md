@@ -128,9 +128,28 @@ See `docs/MoE_ELU_RESTORE.md` and `docs/MoE_SIMPLE_RESTORE.md` for architecture 
 
 ---
 
-## Training
+## Installation
 
-Requires [IsaacGym](https://developer.nvidia.com/isaac-gym) and [rl_games](https://github.com/Denys88/rl_games).
+1. Install [IsaacGym Preview 4](https://developer.nvidia.com/isaac-gym) following its official guide.
+2. Install the **bundled rl_games** (contains the MoE patch) instead of the stock version:
+
+```bash
+pip install -e rl_games-1.6.1
+```
+
+> The only modification from upstream rl_games is `rl_games/algos_torch/network_builder.py`,
+> which adds the `moe_num_actors` expert-head / gate logic.
+> See `docs/MoE_ELU_RESTORE.md` and `docs/MoE_SIMPLE_RESTORE.md` for architecture details.
+
+3. Install this package:
+
+```bash
+pip install -e .
+```
+
+---
+
+## Training
 
 ```bash
 # PPO baseline
