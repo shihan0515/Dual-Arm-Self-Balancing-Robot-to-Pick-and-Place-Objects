@@ -1,4 +1,4 @@
-name: DiabloBalanceGrasp
+name: DiabloBalanceGraspSAC
 
 physics_engine: ${..physics_engine}
 
@@ -29,13 +29,6 @@ env:
   numObservations: 72
 
   eval_object_name: ""  # Set to "mug", "drill", or "dumbbell" to force a single object type
-  eval_mode: False      # True: accumulate & print episode-level success statistics
-  success_hold_steps: 1 # success conditions must hold N consecutive steps (1 = legacy instant)
-  latch_hold_steps: 1   # partial/tight/phase2 stat latches need N consecutive steps
-
-  # ── Ablation flags ─────────────────────────────────────────────────────
-  ablation_no_phase_gate: False  # True: all reward terms active at every phase (no curriculum)
-  ablation_no_alive_bonus: False # True: remove alive_bonus from reward
 
   objects:
     - name: "mug"

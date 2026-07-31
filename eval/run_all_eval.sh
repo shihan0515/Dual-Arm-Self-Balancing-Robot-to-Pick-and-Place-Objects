@@ -6,9 +6,9 @@
 #   fig_ppo_<ts>_*.png      fig_moe_<ts>_*.png      (plots)
 
 set -e
-export PYTHONPATH=/home/neo/Repositories/IsaacGymEnvs:$PYTHONPATH
+export PYTHONPATH=${IGE_ROOT:?set IGE_ROOT to your IsaacGymEnvs checkout}:$PYTHONPATH
 
-# ── Checkpoints ───────────────────────────────────────────────────────────────
+# ── Checkpoints (edit these to point at your own runs) ────────────────────────
 PPO_CKPT="runs/DiabloBalanceGrasp_PPO_6000_09-21-50-29/nn/DiabloBalanceGrasp_PPO_6000.pth"
 MOE_CKPT="runs/DiabloBalanceGrasp_moe_0.2_10-01-53-46/nn/DiabloBalanceGrasp_moe_0.2.pth"
 
@@ -17,8 +17,17 @@ TASK=DiabloBalanceGrasp
 TRAIN=DiabloBalanceGraspPPO
 NUM_ENVS=500
 GPU_ID=0
-SEEDS=("42" "7" "123")
+SEEDS=("42" "7" "123")          # evaluation seeds
 OBJECTS=("mug" "drill" "dumbbell")
+HOLD=10                          # consecutive steps a condition must hold
+
+# MoE head variant of the checkpoint being evaluated.
+#   ELU heads (the proposed configuration):
+#       MOE_HIDDEN_ARGS="moe_expert_hidden=64 moe_gate_hidden=32"
+#   simple linear heads:
+#       MOE_HIDDEN_ARGS=""
+# A checkpoint trained with one variant CANNOT be loaded with the other.
+MOE_HIDDEN_ARGS="moe_expert_hidden=64 moe_gate_hidden=32"
 
 TS=$(date +%Y%m%d_%H%M%S)
 
@@ -45,12 +54,21 @@ run_eval() {
             local log_file="${log_dir}/${obj}_seed${seed}.log"
             echo "  seed=${seed} ..."
 
+            # eval_mode=True is REQUIRED: without it the PSR / minL2 /
+            # failure-mode counters are never populated and the summary is blank.
+            # hold_steps=10 is the strict criterion used for every number in the
+            # thesis; the default of 1 judges instantaneously and inflates the
+            # rates well above what is reported.
             CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \
                 task=$TASK train=$TRAIN headless=True \
                 num_envs=$NUM_ENVS seed="$seed" test=True \
                 moe_num_actors=$actors \
+                ${MOE_HIDDEN_ARGS} \
                 checkpoint="$ckpt" \
+                task.env.eval_mode=True \
                 task.env.eval_object_name="$obj" \
+                task.env.success_hold_steps=$HOLD \
+                task.env.latch_hold_steps=$HOLD \
                 2>&1 | tee "$log_file"
 
             local sr psr p2r tcr

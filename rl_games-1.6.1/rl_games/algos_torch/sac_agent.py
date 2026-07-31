@@ -491,17 +491,18 @@ class SACAgent(BaseAlgorithm):
             self.current_rewards = self.current_rewards * not_dones
             self.current_lengths = self.current_lengths * not_dones
 
-            if isinstance(next_obs, dict):    
+            if isinstance(next_obs, dict):
                 next_obs_processed = next_obs['obs']
+            else:
+                next_obs_processed = next_obs
 
-            self.obs = next_obs.clone()
+            self.obs = next_obs  # store raw for next play_steps call
 
             rewards = self.rewards_shaper(rewards)
 
             self.replay_buffer.add(obs, action, torch.unsqueeze(rewards, 1), next_obs_processed, torch.unsqueeze(dones, 1))
 
-            if isinstance(obs, dict):
-                obs = self.obs['obs']
+            obs = next_obs_processed  # advance obs for next step in loop
 
             if not random_exploration:
                 self.set_train()

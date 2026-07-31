@@ -33,6 +33,8 @@ env:
   # One-hot encoding of the object type is appended to observations.
   # Set eval_object_name to one of the names below to force a single object during eval.
   eval_object_name: ""
+  # True: accumulate & print episode-level success statistics
+  eval_mode: False
   objects:
     - name: "drill"
       objectRoot: "urdf/ycb/ycb_urdfs-main/ycb_assets/035_power_drill.urdf"

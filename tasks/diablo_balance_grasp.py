@@ -97,6 +97,19 @@ class DiabloBalanceGrasp(VecTask):
         self.balance_min_steps   = env_cfg.get("balanceMinSteps",        1)
         self.grasp_approach_dist = env_cfg.get("graspApproachDist",      0.25)
 
+        # Eval mode: accumulate & print episode-level success statistics
+        self.eval_mode = env_cfg.get("eval_mode", False)
+
+        # Sustained-condition windows (1 = legacy instant judging).
+        # success_hold_steps: success conditions must hold N consecutive steps.
+        # latch_hold_steps:   partial/tight/phase2 stat latches need N consecutive steps.
+        self.success_hold_steps = env_cfg.get("success_hold_steps", 1)
+        self.latch_hold_steps   = env_cfg.get("latch_hold_steps", 1)
+
+        # Ablation flags
+        self.ablation_no_phase_gate  = env_cfg.get("ablation_no_phase_gate",  False)
+        self.ablation_no_alive_bonus = env_cfg.get("ablation_no_alive_bonus", False)
+
         # Reward scales
         rwd = env_cfg["rewards"]
         self.balance_scale         = rwd.get("balanceScale",       3.0)
@@ -130,12 +143,21 @@ class DiabloBalanceGrasp(VecTask):
         # Per-env buffers
         self.phase_buf       = torch.zeros(n, dtype=torch.long,    device=dev)
         self.balance_timer   = torch.zeros(n, dtype=torch.float32, device=dev)
+        self.success_timer   = torch.zeros(n, dtype=torch.float32, device=dev)
+        self.partial_timer   = torch.zeros(n, dtype=torch.float32, device=dev)
+        self.tight_timer     = torch.zeros(n, dtype=torch.float32, device=dev)
+        self.phase2_timer    = torch.zeros(n, dtype=torch.float32, device=dev)
+        self.initial_object_xy = torch.zeros((n, 2), dtype=torch.float32, device=dev)
         self.actions         = torch.zeros((n, 9), dtype=torch.float32, device=dev)
         self.prev_actions    = torch.zeros((n, 9), dtype=torch.float32, device=dev)
         self.episode_success        = torch.zeros(n, dtype=torch.bool, device=dev)
         self.partial_success_buf    = torch.zeros(n, dtype=torch.bool, device=dev)
         self.phase2_achieved_buf    = torch.zeros(n, dtype=torch.bool, device=dev)
         self.tight_contact_buf      = torch.zeros(n, dtype=torch.bool, device=dev)
+        # L2 placement precision & failure-mode diagnostics (used in eval_mode)
+        self.episode_place_L2 = torch.full((n,), float('nan'), device=dev)  # XY(m) at first placement
+        self.episode_min_L2   = torch.full((n,), float('inf'), device=dev)  # min XY(m) while carried
+        self.fell_buf         = torch.zeros(n, dtype=torch.bool, device=dev)
 
         # Per-env object metadata (set at _create_envs, fixed for each env)
         self.object_id           = torch.zeros(n, dtype=torch.long,    device=dev)
@@ -151,6 +173,13 @@ class DiabloBalanceGrasp(VecTask):
         self.total_partial_successes = 0
         self.total_phase2_achieved   = 0
         self.total_tight_contacts    = 0
+        # L2 precision (mm) / efficiency / failure-mode accumulators
+        self.total_place_L2_sum = 0.0; self.total_place_L2_n = 0
+        self.total_min_L2_sum   = 0.0; self.total_min_L2_n   = 0
+        self.total_success_steps = 0.0
+        self.total_falls = 0; self.total_timeouts = 0; self.total_drops = 0
+        # PSR-based failure modes (success = partial_success_buf, not episode_success)
+        self.total_psr_falls = 0; self.total_psr_timeouts = 0; self.total_psr_drops = 0
         self._stat_warmup_done       = False
 
         self.up_axis     = "z"
@@ -594,6 +623,8 @@ class DiabloBalanceGrasp(VecTask):
             initial_object_z   = self.initial_object_z,
             platform_pos       = self.platform_pos_tensor,
             phase_buf          = self.phase_buf,
+            success_timer      = self.success_timer,
+            success_hold_steps = self.success_hold_steps,
             num_envs           = self.num_envs,
             max_episode_length = self.max_episode_length,
             h_mid              = self.h_mid + self.BODY_OFFSET,
@@ -611,6 +642,8 @@ class DiabloBalanceGrasp(VecTask):
             success_bonus      = self.success_bonus,
             fall_penalty       = self.fall_penalty,
             action_penalty_scale = self.action_penalty_scale,
+            ablation_no_phase_gate  = self.ablation_no_phase_gate,
+            ablation_no_alive_bonus = self.ablation_no_alive_bonus,
         )
 
         self.extras["rewards/balance"]       = bal_rew.mean()
@@ -648,19 +681,50 @@ class DiabloBalanceGrasp(VecTask):
         dist_xy_to_plat = torch.norm(self.states["object_pos"][:, :2] - self.platform_pos_tensor[:, :2], dim=-1)
         self.extras["metrics/obj_to_plat_xy"] = dist_xy_to_plat.mean()
 
-        # ── Partial success latch ──────────────────────────────────────────
-        # 定義：Phase 2/3 + XY ≤ 5cm + 物體底部距平台面 ≤ 1cm（含輕微接觸）
+        # ── Sustained-condition stat latches ───────────────────────────────
+        # 條件須連續 latch_hold_steps 步成立才 latch（=1 時為瞬間判定），
+        # 過濾碰撞彈跳 / 甩過容差區造成的瞬間達標。
+        # Partial：Phase 2/3 + XY ≤ 5cm + 物體底部距平台面 ≤ 1cm（含輕微接觸）
         partial_cond = (self.phase_buf >= self.PHASE_PLACE) & \
                        (dist_xy_to_plat < 0.05) & \
                        (dist_z_to_plat > -0.02) & (dist_z_to_plat < 0.01)
-        self.partial_success_buf |= partial_cond
+        self.partial_timer = torch.where(partial_cond, self.partial_timer + 1.0,
+                                         torch.zeros_like(self.partial_timer))
+        self.partial_success_buf |= (self.partial_timer >= self.latch_hold_steps)
 
-        # ── Phase 2 entry latch ───────────────────────────────────────────
-        self.phase2_achieved_buf |= (self.phase_buf >= self.PHASE_PLACE)
+        # ── Phase 2 achievement = sustained carry ────────────────────────
+        # 「物體跟著手移動」：EEF 貼著 handle、物體已離開原位、且沒掉到地上，
+        # 三者持續成立。涵蓋直提/斜提/勾提；彈跳（手沒跟上）、撞倒（位移小）、
+        # 掉落（z 低）皆不成立。不用 phase_buf（彈跳 2cm 即觸發的單向棘輪），
+        # 也不用高度差（傾斜搬運時物體中心不升高）或姿態對齊（漏掉非標準抓姿）。
+        obj_xy_disp = torch.norm(
+            self.states["object_pos"][:, :2] - self.initial_object_xy, dim=-1)
+        phase2_cond = (eef_to_handle_dist < 0.05) & \
+                      (obj_xy_disp > 0.10) & \
+                      (self.states["object_pos"][:, 2] > 0.45)
+        self.phase2_timer = torch.where(phase2_cond, self.phase2_timer + 1.0,
+                                        torch.zeros_like(self.phase2_timer))
+        self.phase2_achieved_buf |= (self.phase2_timer >= self.latch_hold_steps)
 
         # ── Tight contact latch (xy<5cm & |dz|<2cm) ──────────────────────
         tight_cond = (dist_xy_to_plat < 0.05) & (torch.abs(dist_z_to_plat) < 0.02)
-        self.tight_contact_buf |= tight_cond
+        self.tight_timer = torch.where(tight_cond, self.tight_timer + 1.0,
+                                       torch.zeros_like(self.tight_timer))
+        self.tight_contact_buf |= (self.tight_timer >= self.latch_hold_steps)
+
+        # ── L2 placement precision latches (eval diagnostics) ──────────────
+        # place_L2: XY dist (object center → platform center) the FIRST time the
+        # object reaches sustained tight contact. Defined even when the final
+        # release+retreat fails, so it has abundant samples despite low sr.
+        newly_tight = (self.tight_timer >= self.latch_hold_steps) & torch.isnan(self.episode_place_L2)
+        self.episode_place_L2 = torch.where(newly_tight, dist_xy_to_plat, self.episode_place_L2)
+        # min_L2: closest XY approach of the object to the platform centre over
+        # the whole episode — defined for 100% of episodes (incl. ones that never
+        # place). Unconditional min so the placement moment (object height ≈ 0 on
+        # the platform) is not excluded.
+        self.episode_min_L2 = torch.minimum(self.episode_min_L2, dist_xy_to_plat)
+        # Failure-mode latch: did the robot fall at any point this episode
+        self.fell_buf |= is_fallen
 
         # 4. Phase 3 specific metrics (Release & Retreat)
         phase3_mask = (self.phase_buf == self.PHASE_RELEASE)
@@ -747,6 +811,8 @@ class DiabloBalanceGrasp(VecTask):
         obj_y = torch.clamp((torch.rand(num, device=self.device) - 0.5) * 0.20, -0.10, 0.10)
         self.root_state[self.obj_actor_ids[env_ids], 0] = obj_x
         self.root_state[self.obj_actor_ids[env_ids], 1] = obj_y
+        self.initial_object_xy[env_ids, 0] = obj_x
+        self.initial_object_xy[env_ids, 1] = obj_y
         self.root_state[self.obj_actor_ids[env_ids], 2] = self.initial_object_z[env_ids]
         aa = torch.zeros(num, 3, device=self.device)
         aa[:, 2] = math.pi + (torch.rand(num, device=self.device) - 0.5) * 0.5
@@ -788,12 +854,19 @@ class DiabloBalanceGrasp(VecTask):
         self.reset_buf[env_ids]          = 0
         self.phase_buf[env_ids]          = self.PHASE_APPROACH
         self.balance_timer[env_ids]      = 0.0
+        self.success_timer[env_ids]      = 0.0
+        self.partial_timer[env_ids]      = 0.0
+        self.tight_timer[env_ids]        = 0.0
+        self.phase2_timer[env_ids]       = 0.0
         self.actions[env_ids]            = 0.0
         self.prev_actions[env_ids]       = 0.0
         self.episode_success[env_ids]    = False
         self.partial_success_buf[env_ids] = False
         self.phase2_achieved_buf[env_ids] = False
         self.tight_contact_buf[env_ids]   = False
+        self.episode_place_L2[env_ids]    = float('nan')
+        self.episode_min_L2[env_ids]      = float('inf')
+        self.fell_buf[env_ids]            = False
 
     # ── physics step ──────────────────────────────────────────────────────────
 
@@ -941,15 +1014,38 @@ class DiabloBalanceGrasp(VecTask):
         # ── Episode resets ─────────────────────────────────────────────────
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
-            # ── 訓練時關閉，評估時改回 True ──────────────────────────────────
-            _EVAL_MODE = False
-
-            if _EVAL_MODE:
+            if self.eval_mode:
                 self.total_attempts          += len(env_ids)
                 self.total_successes         += self.episode_success[env_ids].sum().item()
                 self.total_partial_successes += self.partial_success_buf[env_ids].sum().item()
                 self.total_phase2_achieved   += self.phase2_achieved_buf[env_ids].sum().item()
                 self.total_tight_contacts    += self.tight_contact_buf[env_ids].sum().item()
+
+                # ── L2 precision / efficiency / failure modes ──────────────
+                _succ = self.episode_success[env_ids]
+                _psr  = self.partial_success_buf[env_ids]
+                _ph   = self.progress_buf[env_ids]
+                # episode_success-based failure modes (original)
+                _fell = self.fell_buf[env_ids] & ~_succ
+                _tmo  = (_ph >= self.max_episode_length - 1) & ~_succ & ~self.fell_buf[env_ids]
+                self.total_falls    += _fell.sum().item()
+                self.total_timeouts += _tmo.sum().item()
+                self.total_drops    += (len(env_ids) - _succ.sum().item()
+                                        - _fell.sum().item() - _tmo.sum().item())
+                # PSR-based failure modes: success = object placed (partial_success_buf)
+                _psr_fell = self.fell_buf[env_ids] & ~_psr
+                _psr_tmo  = (_ph >= self.max_episode_length - 1) & ~_psr & ~self.fell_buf[env_ids]
+                self.total_psr_falls    += _psr_fell.sum().item()
+                self.total_psr_timeouts += _psr_tmo.sum().item()
+                self.total_psr_drops    += (len(env_ids) - _psr.sum().item()
+                                            - _psr_fell.sum().item() - _psr_tmo.sum().item())
+                self.total_success_steps += _ph[_succ].sum().item()
+                _pl2 = self.episode_place_L2[env_ids]; _pv = ~torch.isnan(_pl2)
+                self.total_place_L2_sum += _pl2[_pv].sum().item() * 1000.0   # m→mm
+                self.total_place_L2_n   += int(_pv.sum().item())
+                _ml2 = self.episode_min_L2[env_ids];   _mv = torch.isfinite(_ml2)
+                self.total_min_L2_sum += _ml2[_mv].sum().item() * 1000.0
+                self.total_min_L2_n   += int(_mv.sum().item())
 
                 # Skip stats print during warmup (first num_envs episodes)
                 if not self._stat_warmup_done:
@@ -957,27 +1053,53 @@ class DiabloBalanceGrasp(VecTask):
                         self.total_attempts = 0; self.total_successes = 0
                         self.total_partial_successes = 0; self.total_phase2_achieved = 0
                         self.total_tight_contacts = 0; self._stat_warmup_done = True
+                        self.total_place_L2_sum = 0.0; self.total_place_L2_n = 0
+                        self.total_min_L2_sum = 0.0; self.total_min_L2_n = 0
+                        self.total_success_steps = 0.0
+                        self.total_falls = 0; self.total_timeouts = 0; self.total_drops = 0
+                        self.total_psr_falls = 0; self.total_psr_timeouts = 0; self.total_psr_drops = 0
                     # Fall through to reset_idx so envs are not stuck
                 else:
                     sr  = self.total_successes         / max(self.total_attempts, 1)
                     psr = self.total_partial_successes / max(self.total_attempts, 1)
                     p2r = self.total_phase2_achieved   / max(self.total_attempts, 1)
                     tcr = self.total_tight_contacts    / max(self.total_attempts, 1)
+                    place_L2 = self.total_place_L2_sum / max(self.total_place_L2_n, 1)
+                    min_L2   = self.total_min_L2_sum   / max(self.total_min_L2_n, 1)
+                    steps2succ = self.total_success_steps / max(self.total_successes, 1)
+                    fall_r = self.total_falls    / max(self.total_attempts, 1)
+                    tmo_r  = self.total_timeouts / max(self.total_attempts, 1)
+                    drop_r = self.total_drops    / max(self.total_attempts, 1)
+                    psr_fall_r = self.total_psr_falls    / max(self.total_attempts, 1)
+                    psr_tmo_r  = self.total_psr_timeouts / max(self.total_attempts, 1)
+                    psr_drop_r = self.total_psr_drops    / max(self.total_attempts, 1)
                     self.extras["metrics/success_rate"]         = sr
                     self.extras["metrics/partial_success_rate"] = psr
                     self.extras["metrics/phase2_achieved_rate"] = p2r
                     self.extras["metrics/tight_contact_rate"]   = tcr
+                    self.extras["metrics/place_L2_mm"]          = place_L2
+                    self.extras["metrics/min_L2_mm"]            = min_L2
                     print(f"final success_rate: {sr:.4f}  "
                           f"final partial_success_rate: {psr:.4f}  "
                           f"final phase2_rate: {p2r:.4f}  "
                           f"final tight_contact_rate: {tcr:.4f}  "
                           f"({self.total_attempts} eps)")
+                    print(f"final place_L2(mm): {place_L2:.2f} (n={self.total_place_L2_n}/{self.total_attempts})  "
+                          f"final min_L2(mm): {min_L2:.2f}  "
+                          f"final steps_to_success: {steps2succ:.1f}  "
+                          f"final fall_rate: {fall_r:.4f}  "
+                          f"final timeout_rate: {tmo_r:.4f}  "
+                          f"final drop_rate: {drop_r:.4f}")
+                    print(f"final psr_fall_rate: {psr_fall_r:.4f}  "
+                          f"final psr_timeout_rate: {psr_tmo_r:.4f}  "
+                          f"final psr_drop_rate: {psr_drop_r:.4f}")
 
             self.reset_idx(env_ids)
             self.episode_success[env_ids]     = False
             self.partial_success_buf[env_ids] = False
             self.phase2_achieved_buf[env_ids] = False
             self.tight_contact_buf[env_ids]   = False
+            self.fell_buf[env_ids]            = False
 
         self.compute_observations()
         self.compute_reward()
@@ -993,6 +1115,7 @@ def compute_balance_grasp_reward(
     eef_pos, eef_rot, handle_pos, handle_rot,
     object_pos, object_rot, initial_object_z,
     platform_pos, phase_buf,
+    success_timer, success_hold_steps: int,
     num_envs: int, max_episode_length: float,
     h_mid: float, h_grasp_mid: float, fall_pitch_thr: float,
     object_half_height,   # per-env tensor [num_envs]
@@ -1000,8 +1123,15 @@ def compute_balance_grasp_reward(
     approach_scale: float, dist_scale: float, rot_scale: float,
     grasp_scale: float, lift_scale: float, success_bonus: float,
     fall_penalty: float, action_penalty_scale: float,
+    ablation_no_phase_gate: bool = False,
+    ablation_no_alive_bonus: bool = False,
 ):
     dev = base_pos.device
+
+    # Ablation: phase_rew is used for reward gating only (phase_buf still updates normally)
+    phase_rew = torch.full_like(phase_buf, 3) if ablation_no_phase_gate else phase_buf
+    if ablation_no_alive_bonus:
+        alive_bonus = 0.0
 
     # ── Pitch / roll ──────────────────────────────────────────────────────
     qx, qy, qz, qw = base_quat[:,0], base_quat[:,1], base_quat[:,2], base_quat[:,3]
@@ -1038,15 +1168,15 @@ def compute_balance_grasp_reward(
     # Phase 1 & 2: h_grasp_low (0.42) - lowered to help reach mug
     # Phase 3: h_mid (0.45) - lowered to ensure arm can press object to platform
     
-    is_approaching = (phase_buf == 0)
-    is_manipulating = (phase_buf == 1) | (phase_buf == 2)
-    is_releasing = (phase_buf == 3)
-    
+    is_approaching = (phase_rew == 0)
+    is_manipulating = (phase_rew == 1) | (phase_rew == 2)
+    is_releasing = (phase_rew == 3)
+
     h_grasp_low = 0.42
-    height_target = torch.where(is_approaching, torch.full_like(base_pos[:, 2], h_mid), 
+    height_target = torch.where(is_approaching, torch.full_like(base_pos[:, 2], h_mid),
                     torch.where(is_manipulating, torch.full_like(base_pos[:, 2], h_grasp_low),
                     torch.full_like(base_pos[:, 2], h_mid)))
-    
+
     height_err = torch.abs(base_pos[:, 2] - height_target)
     height_rew = torch.exp(-20.0 * height_err**2) * height_scale
 
@@ -1067,7 +1197,7 @@ def compute_balance_grasp_reward(
     # ── 5. EEF reaching (Phase 1) ─────────────────────────────────────────
     d_eef    = torch.norm(eef_pos - handle_pos, p=2, dim=-1)
     dist_rew = 1.0 / (1.0 + 40.0 * d_eef**2) * dist_scale
-    dist_rew = torch.where(phase_buf >= 1, dist_rew, dist_rew * 0.1)
+    dist_rew = torch.where(phase_rew >= 1, dist_rew, dist_rew * 0.1)
 
     # ── 6. Orientation alignment (Phase 1 & 2) ───────────────────────────────
     ax1 = quat_apply(eef_rot, torch.tensor([0.,0.,-1.], device=dev).repeat(num_envs,1))
@@ -1077,21 +1207,21 @@ def compute_balance_grasp_reward(
     dot1 = (ax1 * ax2).sum(-1)
     dot2 = (ax3 * ax4).sum(-1)
     rot_rew = 0.5 * (torch.clamp(dot1, max=0.0) + torch.clamp(dot2, min=0.0)) * rot_scale
-    rot_rew = torch.where(phase_buf >= 1, rot_rew, torch.zeros_like(rot_rew))
+    rot_rew = torch.where(phase_rew >= 1, rot_rew, torch.zeros_like(rot_rew))
 
     # ── 7. Grasp ──────────────────────────────────────────────────────────
     is_aligned   = (dot1 < -0.60) & (dot2 > 0.60)
     is_close_eef = (d_eef < 0.035) & is_aligned
     gripper_close = actions[:, 8] >= 0.0
     grasp_rew = torch.where(
-        is_close_eef & gripper_close & (phase_buf == 1),
+        is_close_eef & gripper_close & (phase_rew == 1),
         torch.full_like(dist_rew, grasp_scale * 2.0),
         torch.zeros_like(dist_rew))
 
     # ── 8. Lift ───────────────────────────────────────────────────────────
     obj_height  = object_pos[:, 2] - initial_object_z
-    is_grasping = is_close_eef & gripper_close & (phase_buf >= 1)
-    
+    is_grasping = is_close_eef & gripper_close & (phase_rew >= 1)
+
     # Tightened on-plat threshold to prevent hovering release
     is_on_plat   = is_over_plat & (torch.abs(dist_z_to_plat_surface) < 0.012)
 
@@ -1108,24 +1238,19 @@ def compute_balance_grasp_reward(
                                   torch.zeros_like(orient_rew))
 
     # ── 9. Transport & Placement (Phase 2 & 3) ────────────────────────────
-    # Phase 2: Move above platform (3cm gap)
     is_over_plat = (dist_xy_to_plat < 0.05)
     target_z_gap = 0.03
     z_gap_err = torch.abs(dist_z_to_plat_surface - target_z_gap)
 
-    # Stronger long-range pull to platform
     plat_attract_rew = (1.0 / (1.0 + 3.0 * dist_xy_to_plat)) * 40.0
 
-    trans_rew = torch.where(((phase_buf == 2) | (phase_buf == 3)) & (is_grasping | is_on_plat),
+    trans_rew = torch.where(((phase_rew == 2) | (phase_rew == 3)) & (is_grasping | is_on_plat),
                              plat_attract_rew + 10.0 * torch.exp(-20.0 * z_gap_err**2),
                              torch.zeros_like(dist_rew))
-    trans_rew = torch.where((phase_buf >= 2) & (~is_upright), trans_rew * 0.1, trans_rew)
+    trans_rew = torch.where((phase_rew >= 2) & (~is_upright), trans_rew * 0.1, trans_rew)
 
-    # Phase 3: Landing & Release
-    # Sharpen placement reward to peak at exact contact
     place_rew = 100.0 * torch.exp(-40.0 * torch.abs(dist_z_to_plat_surface))
-    # Place reward should persist after release if it's on the platform
-    place_rew = torch.where((phase_buf == 3) & (is_grasping | is_on_plat) & is_upright,
+    place_rew = torch.where((phase_rew == 3) & (is_grasping | is_on_plat) & is_upright,
                              place_rew, torch.zeros_like(dist_rew))
 
     # ── 10. Grasp-balance synergy ──────────────────────────────────────────
@@ -1137,55 +1262,52 @@ def compute_balance_grasp_reward(
     # ── 11. Release & Success ─────────────────────────────────────────────
     gripper_open    = actions[:, 8] < 0.0
     eef_dist_to_handle = torch.norm(eef_pos - handle_pos, p=2, dim=-1)
-    
-    # Successful release: on plat, upright, and gripper opens
-    is_releasing_act = (phase_buf == 3) & is_on_plat & is_upright & gripper_open
+
+    is_releasing_act = (phase_rew == 3) & is_on_plat & is_upright & gripper_open
     release_rew     = torch.where(is_releasing_act,
                                    torch.full_like(dist_rew, 100.0),
                                    torch.zeros_like(dist_rew))
-    
-    # Retreat: move EEF away from handle after release, specifically BACKWARD
-    # Project retreat vector onto robot's backward axis (-X)
+
     back_dir = quat_apply(base_quat, torch.tensor([-1., 0., 0.], device=dev).repeat(num_envs, 1))
     retreat_vec = eef_pos - handle_pos
     retreat_back_proj = (retreat_vec * back_dir).sum(-1)
     retreat_up_proj   = retreat_vec[:, 2]
-    
-    # Strengthen retreat reward: make it more aggressive and reward further movement
-    is_retreating = (phase_buf == 3) & gripper_open & is_on_plat
+
+    is_retreating = (phase_rew == 3) & gripper_open & is_on_plat
     retreat_rew = torch.where(is_retreating,
                                torch.clamp(retreat_back_proj, 0.0, 0.15) * 4000.0,
                                torch.zeros_like(dist_rew))
-    
-    # Retreat UP penalty: strongly penalize lifting arm while retreating (avoids hitting dumbbell top)
+
     retreat_up_pen = torch.where(is_retreating & (retreat_up_proj > 0.01),
                                   retreat_up_proj * 5000.0,
                                   torch.zeros_like(dist_rew))
-    
-    # Penalty for hovering over platform in Phase 3 without releasing
-    # OR staying near the handle after releasing
-    hover_pen       = torch.where((phase_buf == 3) & is_over_plat & (~gripper_open),
+
+    hover_pen       = torch.where((phase_rew == 3) & is_over_plat & (~gripper_open),
                                    torch.full_like(dist_rew, 5.0),
                                    torch.zeros_like(dist_rew))
-    
-    # Stay-near-handle penalty: if gripper is open in phase 3 but haven't retreated enough
+
     stay_near_pen = torch.where(is_retreating & (retreat_back_proj < 0.10),
                                  torch.full_like(dist_rew, 10.0),
                                  torch.zeros_like(dist_rew))
 
     # Platform collision penalty for EEF (stay above platform surface)
-    plat_collision_pen = torch.where((phase_buf == 3) & is_over_plat & (eef_pos[:, 2] < plat_surface_z + 0.02),
+    plat_collision_pen = torch.where((phase_rew == 3) & is_over_plat & (eef_pos[:, 2] < plat_surface_z + 0.02),
                                       torch.full_like(dist_rew, 5.0),
                                       torch.zeros_like(dist_rew))
 
-    is_success  = (phase_buf == 3) & is_on_plat & is_upright & is_balanced & gripper_open & (retreat_back_proj > 0.12)
+    success_cond = (phase_buf == 3) & is_on_plat & is_upright & is_balanced & gripper_open & (retreat_back_proj > 0.12)
+    # Success counts only after the condition holds success_hold_steps consecutive
+    # steps, filtering touch-and-go placements that immediately tip or slide off.
+    success_timer[:] = torch.where(success_cond, success_timer + 1.0,
+                                   torch.zeros_like(success_timer))
+    is_success  = success_timer >= success_hold_steps
     success_rew = torch.where(is_success,
                                torch.full_like(dist_rew, success_bonus),
                                torch.zeros_like(dist_rew))
 
     # ── 12. Braking (Phase 1, 2, 3) ─────────────────────────────────────────
     # Slightly reduced braking penalty to avoid jitter from conflicting balance/stop commands
-    braking_pen = torch.where(phase_buf >= 1,
+    braking_pen = torch.where(phase_rew >= 1,
                                torch.sum(actions[:, 2:4]**2, dim=-1) * 1.5,
                                torch.zeros_like(dist_rew))
 

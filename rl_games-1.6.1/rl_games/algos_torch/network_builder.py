@@ -275,14 +275,35 @@ class A2CBuilder(NetworkBuilder):
                 sigma_init = self.init_factory.create(**self.space_config['sigma_init'])
 
                 if self.moe_num_actors > 1:
-                    self.mu_experts = nn.ModuleList([
-                        nn.Linear(out_size, actions_num)
-                        for _ in range(self.moe_num_actors)
-                    ])
-                    self.mu_gate = nn.Linear(out_size, self.moe_num_actors)
+                    eh, gh = self.moe_expert_hidden, self.moe_gate_hidden
+                    if eh > 0:
+                        self.mu_experts = nn.ModuleList([
+                            nn.Sequential(
+                                nn.Linear(out_size, eh),
+                                nn.ELU(),
+                                nn.Linear(eh, actions_num),
+                            )
+                            for _ in range(self.moe_num_actors)
+                        ])
+                    else:
+                        self.mu_experts = nn.ModuleList([
+                            nn.Linear(out_size, actions_num)
+                            for _ in range(self.moe_num_actors)
+                        ])
+                    if gh > 0:
+                        self.mu_gate = nn.Sequential(
+                            nn.Linear(out_size, gh),
+                            nn.ELU(),
+                            nn.Linear(gh, self.moe_num_actors),
+                        )
+                    else:
+                        self.mu_gate = nn.Linear(out_size, self.moe_num_actors)
+                    expert_arch = (f"{out_size}→{eh}→{actions_num}" if eh > 0
+                                   else f"{out_size}→{actions_num}")
+                    gate_arch   = (f"{out_size}→{gh}→{self.moe_num_actors}" if gh > 0
+                                   else f"{out_size}→{self.moe_num_actors}")
                     print(f"[MoE] {self.moe_num_actors} experts | "
-                          f"expert: {out_size}→{actions_num} | "
-                          f"gate: {out_size}→{self.moe_num_actors}")
+                          f"expert: {expert_arch} | gate: {gate_arch}")
                 else:
                     self.mu = nn.Linear(out_size, actions_num)
 
@@ -308,7 +329,8 @@ class A2CBuilder(NetworkBuilder):
             if self.is_continuous:
                 if self.moe_num_actors > 1:
                     for expert in self.mu_experts:
-                        mu_init(expert.weight)
+                        mu_init(expert[-1].weight if self.moe_expert_hidden > 0
+                                else expert.weight)
                 else:
                     mu_init(self.mu.weight)
                 if self.fixed_sigma:
@@ -476,6 +498,8 @@ class A2CBuilder(NetworkBuilder):
                 )
                 # [batch, moe_num_actors]
                 gate_weights = torch.softmax(self.mu_gate(actor_out), dim=-1)
+                # Stash for offline gate analysis (harmless; detached, no grad effect)
+                self.last_gate_weights = gate_weights.detach()
                 # Weighted sum over experts -> [batch, actions_num]
                 return torch.sum(expert_mus * gate_weights.unsqueeze(-1), dim=1)
             return self.mu(actor_out)
@@ -556,8 +580,11 @@ class A2CBuilder(NetworkBuilder):
                 self.has_cnn = False
 
             self.moe_num_actors    = params.get('moe_num_actors', 1)
-            self.gate_temperature  = params.get('gate_temperature', 0.3)
-            self.gate_phase_idx    = params.get('gate_phase_idx', -1)
+            # MoE head variant: 0 = single Linear (simple), >0 = Linear→ELU→Linear
+            # with this hidden width. Checkpoints are only loadable with the same
+            # settings they were trained with (state_dict key layout differs).
+            self.moe_expert_hidden = params.get('moe_expert_hidden', 0)
+            self.moe_gate_hidden   = params.get('moe_gate_hidden', 0)
 
     def build(self, name, **kwargs):
         net = A2CBuilder.Network(self.params, **kwargs)

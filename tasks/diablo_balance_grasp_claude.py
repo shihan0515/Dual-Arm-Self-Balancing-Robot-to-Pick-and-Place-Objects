@@ -97,6 +97,9 @@ class DiabloBalanceGraspClaude(VecTask):
         self.balance_min_steps   = env_cfg.get("balanceMinSteps",        1)
         self.grasp_approach_dist = env_cfg.get("graspApproachDist",      0.25)
 
+        # Eval mode: accumulate & print episode-level success statistics
+        self.eval_mode = env_cfg.get("eval_mode", False)
+
         # Reward scales
         rwd = env_cfg["rewards"]
         self.balance_scale         = rwd.get("balanceScale",       3.0)
@@ -987,10 +990,7 @@ class DiabloBalanceGraspClaude(VecTask):
         # ── Episode resets ─────────────────────────────────────────────────
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
-            # ── 訓練時關閉，評估時改回 True ──────────────────────────────────
-            _EVAL_MODE = False
-
-            if _EVAL_MODE:
+            if self.eval_mode:
                 self.total_attempts          += len(env_ids)
                 self.total_successes         += self.episode_success[env_ids].sum().item()
                 self.total_partial_successes += self.partial_success_buf[env_ids].sum().item()
@@ -1173,11 +1173,12 @@ def compute_balance_grasp_reward(
     place_rew = torch.where((phase_buf == 3) & (is_grasping | is_on_plat) & is_upright,
                              place_rew, torch.zeros_like(dist_rew))
 
-    # ── 10. Grasp-balance synergy ──────────────────────────────────────────
+    # ── 10. Grasp-balance synergy (MoE-specific; disabled for fair algorithm comparison)
     is_lifted = (obj_height > 0.03)
-    grasp_bal_bonus = torch.where(is_grasping & is_balanced & is_lifted,
-                                   torch.full_like(dist_rew, 5.0),
-                                   torch.zeros_like(dist_rew))
+    # grasp_bal_bonus = torch.where(is_grasping & is_balanced & is_lifted,
+    #                                torch.full_like(dist_rew, 5.0),
+    #                                torch.zeros_like(dist_rew))
+    grasp_bal_bonus = torch.zeros_like(dist_rew)
 
     # ── 11. Release & Success ─────────────────────────────────────────────
     gripper_open    = actions[:, 8] < 0.0

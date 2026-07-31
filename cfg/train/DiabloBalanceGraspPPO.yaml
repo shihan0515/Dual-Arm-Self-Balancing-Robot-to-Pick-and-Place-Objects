@@ -10,6 +10,8 @@ params:
   network:
     name: actor_critic
     moe_num_actors: ${resolve_default:1,${....moe_num_actors}}
+    moe_expert_hidden: ${resolve_default:0,${....moe_expert_hidden}}
+    moe_gate_hidden: ${resolve_default:0,${....moe_gate_hidden}}
     separate: False
     space:
       continuous:
