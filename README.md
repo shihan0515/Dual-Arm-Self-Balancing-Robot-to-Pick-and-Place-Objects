@@ -19,14 +19,13 @@ task environments, their configs, the modified `rl_games` that implements the
 Mixture-of-Experts actor, and the training and evaluation drivers.
 
 It is a curated subset, not a standalone runnable package — there is no
-`train.py` or `setup.py` here. To actually run anything, use the full
-IsaacGymEnvs fork these files come from:
+`train.py` or `setup.py` here. Those come from NVIDIA's IsaacGymEnvs, into
+which the files in this repository are dropped; the installation section below
+walks through it.
 
-> **https://github.com/shihan0515/IsaacGymEnvs** (branch `Neo`)
-> — complete, runnable, and includes `REPRODUCE.md` plus the raw evaluation logs
-> behind every number in the thesis.
-
-Everything below is written against that checkout.
+The raw per-seed evaluation logs behind every number in the thesis are not
+published here for size reasons. They are available on request
+(conon068@gmail.com).
 
 ```
 ├── tasks/
@@ -80,18 +79,49 @@ MoE gain exists before any locomotion coupling is added.
 # 1. IsaacGym Preview 4 — https://developer.nvidia.com/isaac-gym
 cd isaacgym/python && pip install -e .
 
-# 2. The runnable fork
-git clone -b Neo https://github.com/shihan0515/IsaacGymEnvs.git
-cd IsaacGymEnvs && pip install -e .
+# 2. NVIDIA IsaacGymEnvs, which provides train.py and the framework
+git clone https://github.com/NVIDIA-Omniverse/IsaacGymEnvs.git
+cd IsaacGymEnvs && pip install -e . && cd ..
 
-# 3. The bundled rl_games — NOT the PyPI version
-cd rl_games-1.6.1 && pip install -e . && cd ..
+# 3. This repository
+git clone https://github.com/shihan0515/Dual-Arm-Self-Balancing-Robot-to-Pick-and-Place-Objects.git thesis-code
 
-# 4. Every shell you train or evaluate in
+# 4. Drop the task files, configs and assets into IsaacGymEnvs
+cp thesis-code/tasks/*.py        IsaacGymEnvs/isaacgymenvs/tasks/
+cp thesis-code/cfg/task/*.yaml   IsaacGymEnvs/isaacgymenvs/cfg/task/
+cp thesis-code/cfg/train/*.yaml  IsaacGymEnvs/isaacgymenvs/cfg/train/
+cp -r thesis-code/assets/urdf/*  IsaacGymEnvs/assets/urdf/
+
+# 5. The bundled rl_games — NOT the PyPI version
+cd thesis-code/rl_games-1.6.1 && pip install -e . && cd ../..
+
+# 6. Every shell you train or evaluate in
 export PYTHONPATH=/path/to/IsaacGymEnvs:$PYTHONPATH
 ```
 
-**Step 3 is not optional.** The MoE actor exists only in the bundled
+Then register the tasks in `IsaacGymEnvs/isaacgymenvs/tasks/__init__.py`:
+
+```python
+from .diablo_balance_grasp import DiabloBalanceGrasp
+from .diablo_graspcustom3 import DiabloGraspCustom3
+
+isaacgym_task_map = {
+    ...
+    "DiabloBalanceGrasp":    DiabloBalanceGrasp,
+    "DiabloBalanceGraspSAC": DiabloBalanceGrasp,
+    "DiabloGraspCustom3":    DiabloGraspCustom3,
+}
+```
+
+and add the MoE switches to `isaacgymenvs/cfg/config.yaml`:
+
+```yaml
+moe_num_actors: 1
+moe_expert_hidden: 0    # >0 builds Linear→ELU→Linear expert heads
+moe_gate_hidden: 0      # >0 builds Linear→ELU→Linear gate
+```
+
+**Step 5 is not optional.** The MoE actor exists only in the bundled
 `rl_games`. Installing `rl_games` from PyPI does not error — it silently gives
 you a plain MLP actor, and every MoE result collapses to the PPO baseline.
 
@@ -286,8 +316,8 @@ Reward ablation, single seed: the full design reaches 0.968 macro PSR; without
 the alive bonus 0.806; without the phase-gate 0.000, with 97.6 % of episodes
 timing out because the robot never approaches the object.
 
-Per-seed numbers and the raw evaluation logs are in the
-[full repository](https://github.com/shihan0515/IsaacGymEnvs).
+Per-seed numbers and the raw evaluation logs are available on request
+(conon068@gmail.com).
 
 ---
 
