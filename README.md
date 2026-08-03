@@ -10,6 +10,17 @@ object from a table and place it on a platform. The hard part is that the
 chassis is an inverted pendulum: it has to keep itself upright while the arm
 reaches, lifts, and places, and the payload keeps changing the dynamics.
 
+## Demonstration videos
+
+| | |
+|---|---|
+| **Scenario 1 — fixed-base manipulation** | [▶ watch](https://drive.google.com/file/d/1EChZMiL5lno2W-4UHKll3jUtnmPaTxEV/view) |
+| **Scenario 2 — self-balancing mobile grasping** | [▶ watch](https://drive.google.com/file/d/13W73F0e0umDTXaq9M_lTE36xbI1EmzMv/view) |
+
+Scenario 2 is the primary result: the chassis balances itself throughout, and
+the base visibly adjusts its height and pitch to compensate for the payload
+while the arm carries and places the object.
+
 ---
 
 ## Contents
@@ -320,8 +331,3 @@ Per-seed numbers and the raw evaluation logs are available on request
 (conon068@gmail.com).
 
 ---
-
-## Demonstration videos
-
-- [Object manipulation (Scenario 1)](https://drive.google.com/file/d/1EChZMiL5lno2W-4UHKll3jUtnmPaTxEV/view?usp=sharing)
-- [Self-balancing mobile grasping (Scenario 2)](https://drive.google.com/file/d/13W73F0e0umDTXaq9M_lTE36xbI1EmzMv/view?usp=sharing)
