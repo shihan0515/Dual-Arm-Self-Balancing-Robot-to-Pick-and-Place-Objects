@@ -71,7 +71,7 @@ published here for size reasons. They are available on request
 | Chassis | rigidly fixed | free-floating, actively balanced |
 | Task file | `diablo_graspcustom3.py` | `diablo_balance_grasp.py` |
 | Action space | 5-D: 4 arm joints + gripper¹ | 9-D task space |
-| Observation | 92-D | 72-D |
+| Observation | 98-D | 72-D |
 | Phase machine | none (single stage) | four phases |
 | Metrics | SR, final L2 error | PSR, minL2 |
 
